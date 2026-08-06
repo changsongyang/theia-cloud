@@ -16,11 +16,6 @@ variable "keycloak_admin_password" {
   sensitive   = true
 }
 
-variable "postgres_postgres_password" {
-  description = "Keycloak Postgres DB Postgres (Admin) Password"
-  sensitive   = true
-}
-
 variable "postgres_password" {
   description = "Keycloak Postgres DB Password"
   sensitive   = true
@@ -50,6 +45,12 @@ resource "google_compute_address" "host_ip" {
   name       = "theia-cloud-ingress-ip"
 }
 
+provider "kubernetes" {
+  host                   = module.cluster.cluster_host
+  token                  = module.cluster.cluster_token
+  cluster_ca_certificate = module.cluster.cluster_ca_certificate
+}
+
 provider "helm" {
   kubernetes = {
     host                   = module.cluster.cluster_host
@@ -65,27 +66,70 @@ provider "kubectl" {
   cluster_ca_certificate = module.cluster.cluster_ca_certificate
 }
 
-module "helm" {
-  source = "../../modules/helm"
+# Manually install cert-manager to have its CRDs available for the theia-cloud-base module, which installs the cluster issuer for let's encrypt.
+resource "helm_release" "cert_manager" {
+  name             = "cert-manager"
+  repository       = "https://charts.jetstack.io"
+  chart            = "cert-manager"
+  version          = "v1.17.4"
+  namespace        = "cert-manager"
+  create_namespace = true
 
-  install_ingress_controller  = true
-  ingress_controller_type     = var.ingress_controller_type
-  cert_manager_issuer_email   = var.cert_manager_issuer_email
-  cert_manager_cluster_issuer = "letsencrypt-prod"
-  cert_manager_common_name    = "${google_compute_address.host_ip.address}.sslip.io"
-  hostname                    = "${google_compute_address.host_ip.address}.sslip.io"
-  keycloak_admin_password     = var.keycloak_admin_password
-  postgresql_enabled          = true
-  postgres_postgres_password  = var.postgres_postgres_password
-  postgres_password           = var.postgres_password
-  loadBalancerIP              = google_compute_address.host_ip.address
+  set = [
+    {
+      name  = "installCRDs"
+      value = "true"
+    }
+  ]
+}
+
+# Install theia-cloud-base first because we re-use the "letsencrypt-prod" ClusterIssuer created by that module for the Keycloak ingress installed in the cluster prerequisites module.
+module "theia-cloud-base" {
+  source = "../../modules/theia-cloud"
+
+  depends_on = [helm_release.cert_manager]
+
+  install_theia_cloud_crds  = false
+  install_theia_cloud       = false
+  hostname                  = "${google_compute_address.host_ip.address}.sslip.io"
+  cert_manager_issuer_email = var.cert_manager_issuer_email
+}
+
+module "cluster_prerequisites" {
+  source = "../../modules/cluster-prerequisites"
+
+  depends_on                          = [module.theia-cloud-base]
+  hostname                            = "${google_compute_address.host_ip.address}.sslip.io"
+  keycloak_admin_password             = var.keycloak_admin_password
+  postgres_password                   = var.postgres_password
+  install_cert_manager                = false
+  install_ingress_controller          = true
+  install_selfsigned_issuer           = false
+  cert_manager_issuer_email           = var.cert_manager_issuer_email
+  ingress_controller_type             = var.ingress_controller_type
+  ingress_class_name                  = var.ingress_controller_type
+  ingress_cert_manager_cluster_issuer = "letsencrypt-prod"
+  load_balancer_ip                    = google_compute_address.host_ip.address
+}
+
+module "theia-cloud" {
+  source = "../../modules/theia-cloud"
+
+  depends_on = [module.cluster_prerequisites]
+
+  install_theia_cloud_base  = false
+  hostname                  = "${google_compute_address.host_ip.address}.sslip.io"
+  ingress_controller_type   = var.ingress_controller_type
+  cert_manager_issuer_email = var.cert_manager_issuer_email
+  cloud_provider            = "K8S"
+  keycloak_url              = module.cluster_prerequisites.keycloak_url
 }
 
 provider "keycloak" {
   client_id      = "admin-cli"
   username       = "admin"
   password       = var.keycloak_admin_password
-  url            = "https://${google_compute_address.host_ip.address}.sslip.io/keycloak"
+  url            = module.cluster_prerequisites.keycloak_url
   initial_login  = false
   client_timeout = 60
 }
@@ -93,9 +137,8 @@ provider "keycloak" {
 module "keycloak" {
   source = "../../modules/keycloak"
 
-  depends_on = [module.helm]
+  depends_on = [module.cluster_prerequisites]
 
-  hostname                        = "${google_compute_address.host_ip.address}.sslip.io"
   keycloak_test_user_foo_password = "foo"
   keycloak_test_user_bar_password = "bar"
   valid_redirect_uri              = "https://${google_compute_address.host_ip.address}.sslip.io/*"
